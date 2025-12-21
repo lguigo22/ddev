@@ -110,7 +110,26 @@ func processHTTPExpose(serviceName string, httpExpose string, isHTTPS bool, exte
 	return routingTable, nil
 }
 
-// PushGlobalTraefikConfig pushes the config into ddev-global-cache
+// PushGlobalTraefikConfig assembles traefik configuration from active projects and pushes
+// it into the ddev-global-cache Docker volume.
+//
+// The process works as follows:
+//  1. Build an inventory of all files that exist in active projects' .ddev/traefik/
+//     directories (config/, certs/, and custom_certs/). This inventory is used to
+//     identify which files in ~/.ddev/traefik/ are "expected" vs "stale".
+//  2. Clean up stale files from ~/.ddev/traefik/config and ~/.ddev/traefik/certs:
+//     - Files present in an active project's traefik directory are kept
+//     - Files NOT in any active project but having #ddev-generated are removed (stale)
+//     - Files NOT in any active project and lacking #ddev-generated are preserved
+//     (these are user-created global config files)
+//  3. Generate/update default global config (default_config.yaml, default certs,
+//     .static_config.yaml with any static_config.*.yaml merges)
+//  4. Copy config and certs from each active project into ~/.ddev/traefik/
+//  5. Push the entire ~/.ddev/traefik/ directory to the Docker volume with
+//     destroyExisting=true, ensuring the volume exactly matches the assembled config
+//
+// This ensures that only running projects have their routing active, while preserving
+// user-customized global configuration files.
 func PushGlobalTraefikConfig(activeApps []*DdevApp) error {
 	globalTraefikDir := filepath.Join(globalconfig.GetGlobalDdevDir(), "traefik")
 	uid, _, _ := dockerutil.GetContainerUser()
@@ -123,7 +142,7 @@ func PushGlobalTraefikConfig(activeApps []*DdevApp) error {
 	globalSourceConfigDir := filepath.Join(globalTraefikDir, "config")
 	inContainerTargetCertsPath := "/mnt/ddev-global-cache/traefik/certs"
 
-	// Set up directores in ~/.ddev/traefik
+	// Set up directories in ~/.ddev/traefik
 	err = os.MkdirAll(globalSourceCertsPath, 0755)
 	if err != nil {
 		return fmt.Errorf("failed to create global Traefik certs dir: %v", err)
@@ -131,6 +150,52 @@ func PushGlobalTraefikConfig(activeApps []*DdevApp) error {
 	err = os.MkdirAll(globalSourceConfigDir, 0755)
 	if err != nil {
 		return fmt.Errorf("failed to create global Traefik config dir: %v", err)
+	}
+
+	// Build inventory of files from active projects' traefik directories.
+	// This allows us to identify stale files that should be removed.
+	activeConfigFiles := make(map[string]bool)
+	activeCertFiles := make(map[string]bool)
+	for _, app := range activeApps {
+		// Enumerate config files from project's traefik/config directory
+		projectConfigDir := app.GetConfigPath("traefik/config")
+		if entries, err := os.ReadDir(projectConfigDir); err == nil {
+			for _, entry := range entries {
+				if !entry.IsDir() {
+					activeConfigFiles[entry.Name()] = true
+				}
+			}
+		}
+		// Enumerate cert files from project's traefik/certs directory
+		projectCertsDir := app.GetConfigPath("traefik/certs")
+		if entries, err := os.ReadDir(projectCertsDir); err == nil {
+			for _, entry := range entries {
+				if !entry.IsDir() {
+					activeCertFiles[entry.Name()] = true
+				}
+			}
+		}
+		// Also enumerate custom_certs directory (these get copied to global certs)
+		projectCustomCertsDir := app.GetConfigPath("custom_certs")
+		if entries, err := os.ReadDir(projectCustomCertsDir); err == nil {
+			for _, entry := range entries {
+				if !entry.IsDir() {
+					activeCertFiles[entry.Name()] = true
+				}
+			}
+		}
+	}
+
+	// Clean up stale generated files from config and certs directories.
+	// Files not present in any active project AND having #ddev-generated are removed.
+	// User-managed files (without #ddev-generated) are preserved.
+	err = cleanStaleTraefikFiles(globalSourceConfigDir, activeConfigFiles, []string{"default_config.yaml"})
+	if err != nil {
+		util.Warning("Failed to clean stale Traefik config files: %v", err)
+	}
+	err = cleanStaleTraefikFiles(globalSourceCertsPath, activeCertFiles, []string{"default_cert.crt", "default_key.key"})
+	if err != nil {
+		util.Warning("Failed to clean stale Traefik cert files: %v", err)
 	}
 
 	// Assume that the #ddev-generated exists in file unless it doesn't
@@ -268,12 +333,13 @@ func PushGlobalTraefikConfig(activeApps []*DdevApp) error {
 		return err
 	}
 
-	// Copy active project configs and certs into the global traefik directory,
+	// Copy active project configs, certs, and custom_certs into the global traefik directory,
 	// so we can do a single CopyIntoVolume with destroyExisting=true.
 	// This ensures only running projects have their routing active in the router.
 	for _, app := range activeApps {
 		projectConfigDir := app.GetConfigPath("traefik/config")
 		projectCertsDir := app.GetConfigPath("traefik/certs")
+		projectCustomCertsDir := app.GetConfigPath("custom_certs")
 
 		// Copy project's config yaml to global config dir
 		projectConfigFile := filepath.Join(projectConfigDir, app.Name+".yaml")
@@ -294,6 +360,16 @@ func PushGlobalTraefikConfig(activeApps []*DdevApp) error {
 				if err != nil {
 					util.Warning("Failed to copy traefik cert for project %s: %v", app.Name, err)
 				}
+			}
+		}
+
+		// Copy project's custom_certs to global certs dir (if they exist)
+		if fileutil.FileExists(filepath.Join(projectCustomCertsDir, app.Name+".crt")) {
+			err = copy2.Copy(projectCustomCertsDir, globalSourceCertsPath)
+			if err != nil {
+				util.Warning("Failed to copy custom certs for project %s: %v", app.Name, err)
+			} else {
+				util.Debug("Copied custom certs from %s to global traefik certs dir", projectCustomCertsDir)
 			}
 		}
 	}
@@ -453,6 +529,68 @@ func configureTraefikForApp(app *DdevApp) error {
 		util.Warning("Failed to copy Traefik into Docker volume ddev-global-cache/traefik: %v", err)
 	} else {
 		util.Debug("Copied Traefik certs in %s to ddev-global-cache/traefik", projectSourceCertsPath)
+	}
+
+	return nil
+}
+
+// cleanStaleTraefikFiles removes stale files from a global traefik directory.
+// It compares files in the global directory against files that exist in active projects'
+// traefik directories. Files that are not present in any active project AND have
+// the #ddev-generated signature are removed. Files in skipFiles are always preserved.
+func cleanStaleTraefikFiles(dir string, activeProjectFiles map[string]bool, skipFiles []string) error {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+
+	// Build skipFiles map for fast lookup
+	skipMap := make(map[string]bool)
+	for _, f := range skipFiles {
+		skipMap[f] = true
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+
+		// Skip files in the skip list (default files)
+		if skipMap[name] {
+			continue
+		}
+
+		// If this file exists in an active project's traefik directory, keep it
+		if activeProjectFiles[name] {
+			continue
+		}
+
+		filePath := filepath.Join(dir, name)
+
+		// File is not from any active project. Check if it has #ddev-generated signature.
+		// If so, it's a stale generated file and should be removed.
+		// If not, it's a user-managed global config file and should be preserved.
+		hasSignature, err := fileutil.FgrepStringInFile(filePath, nodeps.DdevFileSignature)
+		if err != nil {
+			// If we can't read the file, skip it
+			util.Debug("Could not check signature of %s: %v", filePath, err)
+			continue
+		}
+
+		if hasSignature {
+			err = os.Remove(filePath)
+			if err != nil {
+				util.Warning("Failed to remove stale Traefik file %s: %v", filePath, err)
+			} else {
+				util.Debug("Removed stale Traefik file %s (not in any active project)", filePath)
+			}
+		} else {
+			util.Debug("Preserving user-managed file %s (no #ddev-generated signature)", filePath)
+		}
 	}
 
 	return nil

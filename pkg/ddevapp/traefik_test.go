@@ -225,3 +225,118 @@ func TestTraefikStaticConfig(t *testing.T) {
 		})
 	}
 }
+
+// TestTraefikStaleFileCleanup tests that stale generated files are removed
+// but user-managed files (without #ddev-generated) are preserved.
+//
+// The cleanup logic works by building an inventory of files from active projects'
+// .ddev/traefik/ directories. Files in ~/.ddev/traefik/ that are NOT in this
+// inventory AND have #ddev-generated are removed. Files without the signature
+// are preserved as user-managed global config.
+func TestTraefikStaleFileCleanup(t *testing.T) {
+	globalTraefikDir := filepath.Join(globalconfig.GetGlobalDdevDir(), "traefik")
+	globalConfigDir := filepath.Join(globalTraefikDir, "config")
+	globalCertsDir := filepath.Join(globalTraefikDir, "certs")
+
+	site := TestSites[0] // 0 == wordpress
+	app, err := ddevapp.NewApp(site.Dir, true)
+	require.NoError(t, err)
+
+	ddevapp.PowerOff()
+
+	// Files we'll create for testing
+	staleFiles := []string{
+		filepath.Join(globalConfigDir, "stale-project.yaml"),
+		filepath.Join(globalConfigDir, "stale-project_middlewares.yaml"), // Additional config file
+		filepath.Join(globalCertsDir, "stale-project.crt"),
+		filepath.Join(globalCertsDir, "stale-project.key"),
+		filepath.Join(globalConfigDir, "user-managed.yaml"),
+		filepath.Join(globalConfigDir, "router_middlewares.yaml"), // Another user file
+	}
+
+	t.Cleanup(func() {
+		_ = app.Stop(true, false)
+		ddevapp.PowerOff()
+		// Clean up test files
+		for _, f := range staleFiles {
+			_ = os.Remove(f)
+		}
+	})
+
+	// Start the app to generate its config
+	err = app.Start()
+	require.NoError(t, err)
+
+	// Get active projects
+	activeApps := ddevapp.GetActiveProjects()
+	require.NotEmpty(t, activeApps, "expected at least one active project")
+
+	err = os.MkdirAll(globalConfigDir, 0755)
+	require.NoError(t, err)
+	err = os.MkdirAll(globalCertsDir, 0755)
+	require.NoError(t, err)
+
+	// Create stale generated files (with #ddev-generated signature) for a non-existent project.
+	// These simulate files left over from a project that was previously running but is now stopped.
+	staleConfigContent := "#ddev-generated\nhttp:\n  routers: {}\n"
+	staleCertContent := "#ddev-generated\n-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----\n"
+	staleKeyContent := "#ddev-generated\n-----BEGIN PRIVATE KEY-----\nfake\n-----END PRIVATE KEY-----\n"
+
+	// Main project config
+	err = os.WriteFile(filepath.Join(globalConfigDir, "stale-project.yaml"), []byte(staleConfigContent), 0644)
+	require.NoError(t, err)
+	// Additional config file with different name (not just projectname.yaml)
+	err = os.WriteFile(filepath.Join(globalConfigDir, "stale-project_middlewares.yaml"), []byte(staleConfigContent), 0644)
+	require.NoError(t, err)
+	// Certs
+	err = os.WriteFile(filepath.Join(globalCertsDir, "stale-project.crt"), []byte(staleCertContent), 0644)
+	require.NoError(t, err)
+	err = os.WriteFile(filepath.Join(globalCertsDir, "stale-project.key"), []byte(staleKeyContent), 0644)
+	require.NoError(t, err)
+
+	// Create user-managed files (WITHOUT #ddev-generated signature).
+	// These are global config files the user created directly in ~/.ddev/traefik/
+	// and should be preserved regardless of what projects are running.
+	userManagedContent := "# User customized config\nhttp:\n  middlewares:\n    my-middleware:\n      headers:\n        customRequestHeaders:\n          X-Custom-Header: \"value\"\n"
+	err = os.WriteFile(filepath.Join(globalConfigDir, "user-managed.yaml"), []byte(userManagedContent), 0644)
+	require.NoError(t, err)
+	err = os.WriteFile(filepath.Join(globalConfigDir, "router_middlewares.yaml"), []byte(userManagedContent), 0644)
+	require.NoError(t, err)
+
+	// Verify all files exist before cleanup
+	require.FileExists(t, filepath.Join(globalConfigDir, "stale-project.yaml"))
+	require.FileExists(t, filepath.Join(globalConfigDir, "stale-project_middlewares.yaml"))
+	require.FileExists(t, filepath.Join(globalCertsDir, "stale-project.crt"))
+	require.FileExists(t, filepath.Join(globalCertsDir, "stale-project.key"))
+	require.FileExists(t, filepath.Join(globalConfigDir, "user-managed.yaml"))
+	require.FileExists(t, filepath.Join(globalConfigDir, "router_middlewares.yaml"))
+
+	// Call PushGlobalTraefikConfig which should clean up stale files
+	err = ddevapp.PushGlobalTraefikConfig(activeApps)
+	require.NoError(t, err)
+
+	// Verify stale generated files are removed (they have #ddev-generated
+	// and are not in any active project's traefik directory)
+	require.NoFileExists(t, filepath.Join(globalConfigDir, "stale-project.yaml"),
+		"stale-project.yaml should be removed because it has #ddev-generated and is not in any active project")
+	require.NoFileExists(t, filepath.Join(globalConfigDir, "stale-project_middlewares.yaml"),
+		"stale-project_middlewares.yaml should be removed because it has #ddev-generated and is not in any active project")
+	require.NoFileExists(t, filepath.Join(globalCertsDir, "stale-project.crt"),
+		"stale-project.crt should be removed because it has #ddev-generated and is not in any active project")
+	require.NoFileExists(t, filepath.Join(globalCertsDir, "stale-project.key"),
+		"stale-project.key should be removed because it has #ddev-generated and is not in any active project")
+
+	// Verify user-managed files are preserved (they don't have #ddev-generated)
+	require.FileExists(t, filepath.Join(globalConfigDir, "user-managed.yaml"),
+		"user-managed.yaml should be preserved because it does NOT have #ddev-generated")
+	require.FileExists(t, filepath.Join(globalConfigDir, "router_middlewares.yaml"),
+		"router_middlewares.yaml should be preserved because it does NOT have #ddev-generated")
+
+	// Verify default files are preserved
+	require.FileExists(t, filepath.Join(globalConfigDir, "default_config.yaml"),
+		"default_config.yaml should always be preserved")
+
+	// Verify active project files exist
+	require.FileExists(t, filepath.Join(globalConfigDir, app.Name+".yaml"),
+		"active project config should exist")
+}
